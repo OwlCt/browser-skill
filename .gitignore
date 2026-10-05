@@ -1,0 +1,12 @@
+node_modules/
+.env
+.mcp-edge-profile/
+.play-visible-profile/
+.codex/
+.runtime/
+artifacts/
+browser-skill.zip
+__pycache__/
+*.pyc
+*.log
+

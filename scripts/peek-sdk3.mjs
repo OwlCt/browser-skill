@@ -1,0 +1,14 @@
+import fs from 'node:fs';
+const s = fs.readFileSync(process.env.TEMP + '/toy-sdk.js', 'utf8');
+const urls = [...s.matchAll(/`\$\{N\}[^`]+`/g)].map(m => m[0]);
+console.log('N urls', [...new Set(urls)]);
+const nDef = s.match(/var N=`[^`]+`/) || s.match(/N=`[^`]+`/);
+console.log('N', nDef && nDef[0]);
+let i = s.indexOf('/sdk/rank');
+console.log('/sdk/rank', i, s.slice(i - 80, i + 120));
+i = s.indexOf('rank/submit');
+console.log('rank/submit', i, s.slice(Math.max(0,i-80), i+120));
+i = s.indexOf('toy/rank');
+console.log('toy/rank', i, s.slice(Math.max(0,i-80), i+120));
+const kinds = [...s.matchAll(/kind:`[^`]+`/g)].map(m => m[0]);
+console.log('kinds', [...new Set(kinds)]);

@@ -1,0 +1,29 @@
+{
+  "name": "responses-edge-browser",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Microsoft Edge browser tools for OpenAI-compatible Responses API agents",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/cli.mjs",
+    "mcp": "node src/mcp-server.mjs",
+    "mcp:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-codex-mcp.ps1",
+    "mcp:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-codex-mcp.ps1 -Action get",
+    "mcp:remove": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-codex-mcp.ps1 -Action remove",
+    "edge": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-edge.ps1",
+    "edge:mcp:stop": "node scripts/stop-mcp-edge.mjs",
+    "doctor": "node src/doctor.mjs",
+    "doctor:mcp": "node scripts/doctor-mcp.mjs",
+    "doctor:api": "node src/doctor.mjs --api",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.4.2",
+    "openai": "^6.46.0",
+    "playwright-core": "^1.61.1"
+  }
+}
