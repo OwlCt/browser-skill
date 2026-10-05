@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { chromium } from "playwright-core";
 import { loadMcpConfig } from "../src/mcp-config.mjs";
-import { findUserDataDirArgument, isCdpReady } from "../src/edge-session.mjs";
+import { edgeLaunchArguments, findUserDataDirArgument, isCdpReady } from "../src/edge-session.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const isolated = process.argv.includes("--isolated");
@@ -156,16 +156,12 @@ try {
 
   const actualProfile = path.resolve(findUserDataDirArgument(commandLine));
   assert.equal(actualProfile.toLowerCase(), config.edgeUserDataDir.toLowerCase());
-  const requiredFlags = [
-    "--disable-extensions",
-    "--disable-sync",
-    "--enable-automation",
-    ...(config.headless ? ["--headless=new"] : []),
-  ];
-  for (const flag of requiredFlags) {
-    assert.ok(commandLine.includes(flag), `Missing Edge isolation flag: ${flag}`);
+  const expectedArguments = edgeLaunchArguments(config);
+  for (const flag of ["--disable-extensions", "--disable-sync", "--enable-automation", "--headless=new"]) {
+    if (!expectedArguments.includes(flag)) continue;
+    assert.ok(commandLine.includes(flag), `Missing browser launch flag: ${flag}`);
   }
-  assert.equal(commandLine.includes("--headless=new"), config.headless, "Running Edge mode differs from configuration; relaunch the dedicated browser after changing its mode");
+  assert.equal(commandLine.includes("--headless=new"), expectedArguments.includes("--headless=new"), "Running browser mode differs from configuration; relaunch the dedicated browser after changing its mode");
   const rawPageCount = () => browser.contexts()[0].pages().filter((page) => !page.isClosed()).length;
   const otherPageCount = rawPageCount() - 2;
   assert.ok(otherPageCount >= 0);

@@ -2,6 +2,7 @@ import "dotenv/config";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline/promises";
+import { applySavedRuntime, relaunchManagedBrowser } from "./browser-runtime.mjs";
 import { BrowserTools } from "./browser-tools.mjs";
 import { assertApiConfig, loadConfig } from "./config.mjs";
 import { connectEdge } from "./edge-session.mjs";
@@ -36,11 +37,21 @@ async function main() {
   const task = await readTask();
   if (!task) return;
 
-  const config = loadConfig();
+  const workspaceRoot = fileURLToPath(new URL("..", import.meta.url));
+  const config = applySavedRuntime(loadConfig(), process.env, workspaceRoot);
   assertApiConfig(config);
   const logger = (message) => console.error(`[edge-agent] ${message}`);
   const session = await connectEdge(config, logger);
-  const browserTools = new BrowserTools(session, config);
+  const browserTools = new BrowserTools(session, config, {
+    env: process.env,
+    cwd: workspaceRoot,
+    relaunch: (nextConfig, tools) => relaunchManagedBrowser({
+      config,
+      nextConfig,
+      tools,
+      logger,
+    }),
+  });
   const client = createOpenAIClient(config);
   const promptPath = fileURLToPath(new URL("../prompts/browser-agent.md", import.meta.url));
   const instructions = fs.readFileSync(promptPath, "utf8");
@@ -57,10 +68,10 @@ async function main() {
       instructions,
       logger,
     });
-    await session.shutdown({ keepOpen: config.keepEdgeOpen });
+    await browserTools.session.shutdown({ keepOpen: config.keepEdgeOpen });
     process.stdout.write(`${result.text}\n`, () => process.exit(0));
   } catch (error) {
-    await session.shutdown({ keepOpen: config.keepEdgeOpen }).catch(() => {});
+    await browserTools.session.shutdown({ keepOpen: config.keepEdgeOpen }).catch(() => {});
     throw error;
   }
 }

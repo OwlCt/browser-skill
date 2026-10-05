@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { BrowserTools } from "./browser-tools.mjs";
 import { assertApiConfig, loadConfig } from "./config.mjs";
-import { connectEdge, findEdgeExecutable } from "./edge-session.mjs";
+import { browserLabel, connectEdge, findBrowserExecutable } from "./edge-session.mjs";
 import { checkProviderCompatibility, createOpenAIClient } from "./responses-agent.mjs";
 
 function pass(message) {
@@ -13,9 +13,10 @@ function info(message) {
 }
 
 async function checkLocalBrowser(config) {
-  const executable = findEdgeExecutable(config.edgeExecutable);
-  if (!executable) throw new Error("Microsoft Edge executable was not found.");
-  pass(`Edge executable: ${executable}`);
+  const executable = findBrowserExecutable(config);
+  const label = browserLabel(config);
+  if (!executable) throw new Error(`${label} executable was not found.`);
+  pass(`${label} executable: ${executable}`);
 
   const session = await connectEdge(config, info);
   pass(`CDP connection: ${config.cdpUrl}`);

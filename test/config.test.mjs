@@ -35,6 +35,28 @@ test("loadConfig supports third-party Responses endpoints", () => {
   assert.equal(config.clearSessionTabsOnStart, true);
   assert.equal(config.tabIdleTimeoutMs, 60_000);
   assert.equal(config.popupQuietMs, 250);
+  assert.equal(config.browserProduct, "edge");
+  assert.equal(config.disableExtensions, true);
+  assert.equal(config.stealth, false);
+  assert.equal(config.connectionMode, "managed");
+  assert.equal(config.profileDirectory, "Default");
+});
+
+test("Chrome uses its own user data directory and dedicated profile", () => {
+  const config = loadConfig({
+    BROWSER_PRODUCT: "chrome",
+    EDGE_PROFILE_TARGET: "user",
+    LOCALAPPDATA: "C:\\Users\\test\\AppData\\Local",
+    EDGE_USER_DATA_DIR: ".mcp-edge-profile",
+  }, "C:\\workspace");
+
+  assert.equal(config.browserProduct, "chrome");
+  assert.equal(config.edgeUserDataDir, path.join("C:\\Users\\test\\AppData\\Local", "Google", "Chrome", "User Data"));
+  assert.equal(config.dedicatedProfiles.edge, path.resolve("C:\\workspace", ".mcp-edge-profile"));
+  assert.equal(config.dedicatedProfiles.chrome, path.resolve("C:\\workspace", ".mcp-chrome-profile"));
+  assert.equal(config.clearSessionTabsOnStart, false);
+  assert.equal(config.autoCloseTabs, false);
+  assert.ok(config.lifecycleDirectory.includes(`${path.sep}.runtime${path.sep}`));
 });
 
 test("loadConfig rejects invalid compatibility modes", () => {

@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   assertNavigableUrl,
   BrowserTools,
   browserToolDefinitions,
+  pageNeedsManualVerification,
+  parseElementRef,
+  resolveUploadPath,
   sanitizeUrlForModel,
 } from "../src/browser-tools.mjs";
+import { applySavedRuntime, listProfileDirectories, planRuntimeChange, readProfileNames } from "../src/browser-runtime.mjs";
 import {
+  commandLineMatchesProfile,
   createPageInBackground,
   edgeLaunchArguments,
   EdgeSession,
@@ -68,13 +76,17 @@ function makePage(context, { url = "about:blank" } = {}) {
     },
     waitForLoadState: async () => {},
     waitForTimeout: async () => {},
-    evaluate: async () => ({
+    snapshotState: {
       title: "",
       text: "",
       textTruncated: false,
       elements: [],
       viewport: { width: 1, height: 1, scrollY: 0, pageHeight: 1 },
-    }),
+    },
+    setSnapshot(next) {
+      page.snapshotState = next;
+    },
+    evaluate: async () => page.snapshotState,
     on(event, handler) {
       if (!events.has(event)) events.set(event, new Set());
       events.get(event).add(handler);
@@ -129,6 +141,8 @@ function makeOwnedSession(context, page, options = {}) {
 const toolConfig = {
   allowedOrigins: new Set(),
   maxTextChars: 1_000,
+  sitePolicy: "allow",
+  workspaceRoot: os.tmpdir(),
 };
 
 test("browser tools have unique strict function schemas", () => {
@@ -185,7 +199,282 @@ test("background launch arguments start Edge in headless mode", () => {
     headless: true,
   });
   assert.ok(argumentsList.includes("--headless=new"));
+  assert.ok(argumentsList.includes("--enable-automation"));
+  assert.ok(argumentsList.includes("--disable-extensions"));
   assert.equal(argumentsList.at(-1), "about:blank");
+});
+
+test("profile matching does not require the automation flag", () => {
+  const match = commandLineMatchesProfile(
+    ["--user-data-dir=C:\\profiles\\mcp", "--profile-directory=Default"],
+    { edgeUserDataDir: "C:\\profiles\\mcp", profileDirectory: "Default" },
+  );
+  assert.equal(match.ok, true);
+});
+
+test("experimental stealth and extension loading change only their launch flags", () => {
+  const argumentsList = edgeLaunchArguments({
+    cdpUrl: "http://127.0.0.1:9333",
+    edgeUserDataDir: "C:\\profiles\\mcp",
+    headless: false,
+    stealth: true,
+    disableExtensions: false,
+    profileTarget: "user",
+  });
+  assert.equal(argumentsList.includes("--enable-automation"), false);
+  assert.equal(argumentsList.includes("--disable-extensions"), false);
+  assert.equal(argumentsList.includes("--disable-sync"), false);
+  assert.ok(argumentsList.includes("--user-data-dir=C:\\profiles\\mcp"));
+});
+
+test("verification pages pause later automated actions", async () => {
+  const context = makeContext();
+  const page = context.addPage({ url: "https://example.com/challenge" });
+  page.setSnapshot({
+    title: "Just a moment...",
+    text: "Verify you are human",
+    textTruncated: false,
+    elements: [],
+    viewport: { width: 1, height: 1, scrollY: 0, pageHeight: 1 },
+  });
+  const tools = new BrowserTools(makeOwnedSession(context, page), toolConfig);
+  const state = await tools.snapshot();
+  assert.equal(state.needsUser, true);
+  await assert.rejects(
+    () => tools.execute("browser_click", { ref: "e1" }),
+    /paused/,
+  );
+  page.setSnapshot({
+    title: "Example",
+    text: "ready",
+    textTruncated: false,
+    elements: [],
+    viewport: { width: 1, height: 1, scrollY: 0, pageHeight: 1 },
+  });
+  const resumed = await tools.execute("browser_handoff", { action: "resume" });
+  assert.equal(resumed.needsUser, false);
+});
+
+test("manual verification detection stays specific", () => {
+  assert.equal(pageNeedsManualVerification("https://example.com", "Example", "hello"), "");
+  assert.equal(pageNeedsManualVerification("https://challenges.cloudflare.com/cdn-cgi/challenge", "", ""), "verification");
+  assert.equal(pageNeedsManualVerification("https://example.com/login", "Sign in", "", [{ type: "password" }]), "sign-in");
+  assert.equal(pageNeedsManualVerification("https://example.com", "Checkout", "complete the captcha"), "verification");
+});
+
+test("Chrome runtime selection uses the Chrome profile and requires confirmation", () => {
+  const config = {
+    browserProduct: "edge",
+    dedicatedProfiles: {
+      edge: "C:\\workspace\\.mcp-edge-profile",
+      chrome: "C:\\workspace\\.mcp-chrome-profile",
+    },
+    dedicatedUserDataDir: "C:\\workspace\\.mcp-edge-profile",
+    dedicatedRequireProfile: true,
+    dedicatedClearSessionTabs: true,
+    dedicatedAutoCloseTabs: true,
+    edgeUserDataDir: "C:\\workspace\\.mcp-edge-profile",
+    profileDirectory: "Default",
+    profileTarget: "dedicated",
+    connectionMode: "managed",
+    cdpUrl: "http://127.0.0.1:9333",
+    headless: false,
+    disableExtensions: true,
+    stealth: false,
+    allowRemoteCdp: false,
+    workspaceRoot: "C:\\workspace",
+  };
+  assert.throws(
+    () => planRuntimeChange(config, {
+      action: "apply",
+      browser: "chrome",
+      headless: false,
+      load_extensions: true,
+      stealth: false,
+      connection_mode: "managed",
+      profile_target: "user",
+      profile_directory: "Profile 1",
+      user_data_dir: "",
+      cdp_url: "",
+      confirm_external_profile: false,
+    }, { LOCALAPPDATA: "C:\\Users\\test\\AppData\\Local" }),
+    /confirm_external_profile/,
+  );
+});
+
+test("runtime apply changes browser, headless mode, extensions, and stealth", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "browser-runtime-"));
+  fs.mkdirSync(path.join(root, "Google", "Chrome", "User Data", "Profile 2"), { recursive: true });
+  const config = {
+    browserProduct: "edge",
+    dedicatedProfiles: {
+      edge: path.join(root, "edge"),
+      chrome: path.join(root, "chrome"),
+    },
+    dedicatedUserDataDir: path.join(root, "edge"),
+    dedicatedRequireProfile: true,
+    dedicatedClearSessionTabs: false,
+    dedicatedAutoCloseTabs: false,
+    edgeUserDataDir: path.join(root, "edge"),
+    profileDirectory: "Default",
+    profileTarget: "dedicated",
+    connectionMode: "managed",
+    cdpUrl: "http://127.0.0.1:9333",
+    headless: false,
+    disableExtensions: true,
+    stealth: false,
+    allowRemoteCdp: false,
+    workspaceRoot: root,
+  };
+  let relaunched = false;
+  const tools = new BrowserTools({}, config, {
+    env: { LOCALAPPDATA: root },
+    relaunch: async (next, current) => {
+      relaunched = true;
+      Object.assign(current.config, next);
+    },
+  });
+  const result = await tools.execute("browser_runtime", {
+    action: "apply",
+    browser: "chrome",
+    headless: true,
+    load_extensions: true,
+    stealth: true,
+    connection_mode: "managed",
+    profile_target: "dedicated",
+    profile_directory: "",
+    user_data_dir: "",
+    cdp_url: "",
+    confirm_external_profile: false,
+  });
+  assert.equal(relaunched, true);
+  assert.equal(result.relaunched, true);
+  assert.equal(result.browser, "chrome");
+  assert.equal(result.headless, true);
+  assert.equal(result.loadExtensions, true);
+  assert.equal(result.stealth, true);
+  assert.equal(result.userDataDir, path.resolve(root, "chrome"));
+  assert.deepEqual(
+    listProfileDirectories(path.join(root, "Google", "Chrome", "User Data")),
+    ["Profile 2"],
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("runtime apply can change only the requested field", () => {
+  const config = {
+    browserProduct: "edge",
+    dedicatedProfiles: { edge: "C:\\profiles\\edge", chrome: "C:\\profiles\\chrome" },
+    dedicatedUserDataDir: "C:\\profiles\\edge",
+    dedicatedRequireProfile: true,
+    dedicatedClearSessionTabs: false,
+    dedicatedAutoCloseTabs: false,
+    edgeUserDataDir: "C:\\profiles\\edge",
+    profileDirectory: "Default",
+    profileTarget: "dedicated",
+    connectionMode: "managed",
+    cdpUrl: "http://127.0.0.1:9333",
+    headless: false,
+    disableExtensions: true,
+    stealth: false,
+    bringToFront: true,
+    allowRemoteCdp: false,
+    workspaceRoot: "C:\\profiles",
+  };
+  const plan = planRuntimeChange(config, {
+    action: "apply",
+    browser: "keep",
+    headless: "true",
+    load_extensions: "keep",
+    stealth: "keep",
+    bring_to_front: "keep",
+    window: "390x844",
+    connection_mode: "keep",
+    profile_target: "keep",
+    profile_directory: "",
+    user_data_dir: "",
+    cdp_url: "",
+    confirm_external_profile: "keep",
+  });
+  assert.equal(plan.relaunch, true);
+  assert.equal(plan.next.browserProduct, "edge");
+  assert.equal(plan.next.headless, true);
+  assert.equal(plan.next.disableExtensions, true);
+  assert.equal(plan.next.windowWidth, 390);
+  assert.equal(plan.next.windowHeight, 844);
+});
+
+test("profile names omit email addresses from Local State", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "profile-names-"));
+  const userData = path.join(root, "User Data");
+  fs.mkdirSync(path.join(userData, "Profile 1"), { recursive: true });
+  fs.writeFileSync(path.join(userData, "Local State"), JSON.stringify({
+    profile: {
+      info_cache: {
+        "Profile 1": { name: "Work", user_name: "person@example.com" },
+      },
+    },
+  }));
+  assert.deepEqual(readProfileNames(userData), [{ directory: "Profile 1", name: "Work" }]);
+  fs.writeFileSync(path.join(userData, "Local State"), JSON.stringify({
+    profile: { info_cache: { "Profile 1": { name: "person@example.com" } } },
+  }));
+  assert.deepEqual(readProfileNames(userData), [{ directory: "Profile 1" }]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("saved runtime applies unless the process environment locks the field", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "saved-runtime-"));
+  const edgeProfile = path.join(root, "edge");
+  fs.mkdirSync(edgeProfile, { recursive: true });
+  const config = {
+    browserProduct: "edge",
+    dedicatedProfiles: { edge: edgeProfile, chrome: path.join(root, "chrome") },
+    dedicatedUserDataDir: edgeProfile,
+    dedicatedRequireProfile: true,
+    dedicatedClearSessionTabs: false,
+    dedicatedAutoCloseTabs: false,
+    edgeUserDataDir: edgeProfile,
+    profileDirectory: "Default",
+    profileTarget: "dedicated",
+    connectionMode: "managed",
+    cdpUrl: "http://127.0.0.1:9333",
+    headless: false,
+    disableExtensions: true,
+    stealth: false,
+    bringToFront: true,
+    allowRemoteCdp: false,
+    workspaceRoot: root,
+  };
+  fs.mkdirSync(path.join(root, ".runtime"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".runtime", "browser.json"), JSON.stringify({
+    v: 1,
+    browserProduct: "edge",
+    headless: true,
+    disableExtensions: true,
+    stealth: false,
+    connectionMode: "managed",
+    profileTarget: "dedicated",
+    profileDirectory: "Default",
+    edgeUserDataDir: edgeProfile,
+    cdpUrl: "http://127.0.0.1:9333",
+    bringToFront: false,
+  }));
+  assert.equal(applySavedRuntime(config, {}, root).headless, true);
+  assert.equal(applySavedRuntime(config, { EDGE_HEADLESS: "false" }, root).headless, false);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("upload paths must be existing files and frame refs stay explicit", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "upload-path-"));
+  const file = path.join(root, "note.txt");
+  fs.writeFileSync(file, "hello");
+  assert.equal(resolveUploadPath("note.txt", root), file);
+  assert.throws(() => resolveUploadPath("missing.txt", root), /does not exist/);
+  assert.deepEqual(parseElementRef("e3"), { frameIndex: 0, localRef: "e3" });
+  assert.deepEqual(parseElementRef("f2e4"), { frameIndex: 1, localRef: "e4" });
+  assert.equal(parseElementRef("bad"), null);
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 function makeBackgroundPageHarness({ sessionError, createError, gotoError, emitPage = true } = {}) {

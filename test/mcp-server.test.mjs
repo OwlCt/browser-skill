@@ -25,10 +25,12 @@ test("stdio MCP server initializes and lists all browser tools", async () => {
   try {
     await client.connect(transport);
     const result = await client.listTools();
-    assert.equal(result.tools.length, 11);
+    assert.equal(result.tools.length, 21);
+    assert.ok(result.tools.some((tool) => tool.name === "browser_runtime"));
+    assert.ok(result.tools.some((tool) => tool.name === "browser_handoff"));
     assert.ok(result.tools.some((tool) => tool.name === "browser_snapshot"));
     assert.ok(result.tools.some((tool) => tool.name === "browser_screenshot"));
-    assert.match(client.getInstructions(), /dedicated local Edge profile/);
+    assert.match(client.getInstructions(), /local Edge or Chrome profile/);
     assert.match(client.getInstructions(), /background mode must not bring Edge to the foreground/);
     assert.match(client.getInstructions(), /Idle session tabs close automatically/);
   } finally {

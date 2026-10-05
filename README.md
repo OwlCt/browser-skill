@@ -59,7 +59,29 @@ MCP 模式只读取浏览器配置 `.env.mcp`，不读取提供商密钥文件 `
 
 每个 MCP 客户端只会列出和操作自己拥有的标签页。普通导航复用当前标签；网页弹出的标签最多保留最新一个；只有显式调用 `browser_tabs new` 才保留额外标签。`EDGE_TAB_IDLE_TIMEOUT_MS` 控制闲置回收，当前值 `0` 表示关闭计时回收；客户端退出仍会清理自己的标签。冷启动前只清除专用 Profile 保存的标签会话，不删除 Cookie、登录状态或历史记录。
 
-本机当前按用户选择使用有头模式：`EDGE_HEADLESS=false`、`EDGE_BRING_TO_FRONT=true`、`EDGE_KEEP_OPEN=true`。需要后台运行时可改成 `EDGE_HEADLESS=true` 和 `EDGE_BRING_TO_FRONT=false`。更改模式后需在没有其他活动客户端时重启专用 Edge；修改文件不会改变已经运行的浏览器进程。
+本机当前按用户选择使用有头 Edge：`BROWSER_PRODUCT=edge`、`EDGE_HEADLESS=false`、`EDGE_BRING_TO_FRONT=true`、`EDGE_KEEP_OPEN=true`。Chrome 使用同一套 CDP 工具，单独的专用资料在 `.mcp-chrome-profile`，日常资料在本机 Chrome User Data。运行中用 `browser_runtime` 切换，不改文件。
+
+`browser_runtime` 的 `apply` 里，不改的字段传 `keep`。成功后的选择写在 `.runtime/browser.json`，下次启动会用它；进程环境变量仍然优先。可切换：
+
+- `browser`：`edge` 或 `chrome`。
+- `headless`：有头或无头。已经打开的进程不能中途变形，工具会在没有其他客户端时重启受管理的浏览器。
+- `load_extensions`：是否去掉 `--disable-extensions`。
+- `stealth`：实验开关，只省略 `--enable-automation`。不修改 UA、Canvas 或 WebGL，也不保证通过 Cloudflare。
+- `connection_mode`：`managed` 启动所选资料；`attach` 连接已经在回环 CDP 上监听的实例，并且不关闭它。
+- `profile_target`：`dedicated`、`user` 或 `custom`。改到 `user` 或 `custom` 时必须带 `confirm_external_profile=true`。`status` 会列出资料目录和显示名，不读取邮箱、Cookie 或密码。这两种资料不会被清标签、不会在客户端退出时被关掉，生命周期文件写在项目的 `.runtime` 里。
+- `bring_to_front` 和 `window`：当前窗口是否置前，以及 `1280x720` 这样的窗口大小。`default` 取消固定大小。
+
+另外可以悬停、双击、给文件输入框选择本地文件，等待文字、URL 或加载状态，并处理 `alert`、`confirm`、`prompt`。没预先 `browser_dialog arm` 的对话框会被关掉，避免页面卡住。快照会进入同源 iframe。下载保存到 `artifacts`。登录页和验证页会暂停自动操作。
+
+`browser_console`、`browser_network` 和 `browser_styles` 是只读检查。控制台只给消息文本和位置，网络只给方法、地址、类型和状态码，样式只给一组固定的计算样式。不返回请求体、Cookie 或请求头。
+
+`BROWSER_SITE_POLICY=ask` 时，回环地址和 `BROWSER_ALLOWED_ORIGINS` 里的源可以直接打开。其他网站要先让用户选择，再调用 `browser_site`：`allow_once` 只在这次会话有效，`allow` 和 `block` 记在 `.runtime/site-policy.json`。设成 `allow` 则恢复为不询问。
+
+Profile 校验只比较 `--user-data-dir` 和 `--profile-directory`，不依赖 `--enable-automation`。
+
+遇到验证页时，改变动作会暂停。用 `browser_handoff pause` 把窗口交给人，完成后在同一个会话里 `browser_handoff resume`。不要尝试替人通过挑战。
+
+需要后台运行时可把 `EDGE_HEADLESS=true` 和 `EDGE_BRING_TO_FRONT=false` 写成默认值。更改文件不会改变已经运行的浏览器进程。
 
 多个 Codex 任务共享该专用 Edge 时，会通过 Profile 级生命周期锁和客户端 lease 协调启动与关闭。只有 `EDGE_KEEP_OPEN=false` 且最后一个客户端退出时，服务才会主动关闭项目启动的 Edge；每个客户端始终只清理自己的标签。可用以下命令验证生命周期；手动停止命令应在确认没有其他活动客户端或明确需要重启时使用：
 

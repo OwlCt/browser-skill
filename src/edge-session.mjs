@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { chromium } from "playwright-core";
+import { createInspectionLog } from "./inspection.mjs";
 import {
   browserKeyFromWebSocketUrl,
   clearLifecycleState,
@@ -25,15 +26,38 @@ export function isLoopbackHost(hostname) {
     && octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255);
 }
 
+function firstExisting(candidates) {
+  return candidates.filter(Boolean).find((candidate) => fs.existsSync(candidate)) || "";
+}
+
 export function findEdgeExecutable(configuredPath = "", env = process.env) {
-  const candidates = [
+  return firstExisting([
     configuredPath,
     env["ProgramFiles(x86)"] && path.join(env["ProgramFiles(x86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
     env.ProgramFiles && path.join(env.ProgramFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
     env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, "Microsoft", "Edge", "Application", "msedge.exe"),
-  ].filter(Boolean);
+  ]);
+}
 
-  return candidates.find((candidate) => fs.existsSync(candidate)) || "";
+export function findChromeExecutable(configuredPath = "", env = process.env) {
+  return firstExisting([
+    configuredPath,
+    env.ProgramFiles && path.join(env.ProgramFiles, "Google", "Chrome", "Application", "chrome.exe"),
+    env["ProgramFiles(x86)"] && path.join(env["ProgramFiles(x86)"], "Google", "Chrome", "Application", "chrome.exe"),
+    env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
+    process.platform === "darwin" && "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    process.platform !== "win32" && "/usr/bin/google-chrome",
+    process.platform !== "win32" && "/usr/bin/google-chrome-stable",
+  ]);
+}
+
+export function browserLabel(config) {
+  return config?.browserProduct === "chrome" ? "Chrome" : "Edge";
+}
+
+export function findBrowserExecutable(config, env = process.env) {
+  if (config.browserProduct === "chrome") return findChromeExecutable(config.chromeExecutable, env);
+  return findEdgeExecutable(config.edgeExecutable, env);
 }
 
 async function fetchWithTimeout(url, timeoutMs) {
@@ -78,17 +102,51 @@ function normalizeProfilePath(profilePath) {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
-export function findUserDataDirArgument(commandLine = []) {
+export function findCommandLineValue(commandLine = [], name) {
+  const prefix = `${name}=`;
   for (let index = 0; index < commandLine.length; index += 1) {
     const argument = String(commandLine[index]);
-    if (argument === "--user-data-dir") return commandLine[index + 1] || "";
-    if (argument.startsWith("--user-data-dir=")) return argument.slice("--user-data-dir=".length);
+    if (argument === name) return commandLine[index + 1] || "";
+    if (argument.startsWith(prefix)) return argument.slice(prefix.length);
   }
   return "";
 }
 
-async function assertDedicatedProfile(browser, config) {
-  if (!config.requireDedicatedProfile) return;
+export function findUserDataDirArgument(commandLine = []) {
+  return findCommandLineValue(commandLine, "--user-data-dir");
+}
+
+export function commandLineMatchesProfile(commandLine = [], config) {
+  const actualProfile = findUserDataDirArgument(commandLine);
+  if (!actualProfile) return { ok: false, reason: "The listening browser did not advertise --user-data-dir." };
+  if (normalizeProfilePath(actualProfile) !== normalizeProfilePath(config.edgeUserDataDir)) {
+    return {
+      ok: false,
+      reason: `expected profile ${config.edgeUserDataDir}, but the listening browser uses ${actualProfile}.`,
+    };
+  }
+  const actualDirectory = findCommandLineValue(commandLine, "--profile-directory");
+  const expectedDirectory = config.profileDirectory || "Default";
+  if (actualDirectory && actualDirectory !== expectedDirectory) {
+    return {
+      ok: false,
+      reason: `expected profile directory ${expectedDirectory}, but the listening browser uses ${actualDirectory}.`,
+    };
+  }
+  return { ok: true };
+}
+
+function profileCheckRequired(config) {
+  return Boolean(
+    config.requireDedicatedProfile
+    || config.connectionMode === "attach"
+    || config.profileTarget === "user"
+    || config.profileTarget === "custom",
+  );
+}
+
+async function assertExpectedProfile(browser, config) {
+  if (!profileCheckRequired(config)) return;
 
   let cdpSession;
   let commandLine;
@@ -102,9 +160,10 @@ async function assertDedicatedProfile(browser, config) {
     await cdpSession?.detach().catch(() => {});
   }
 
-  const actualProfile = findUserDataDirArgument(commandLine);
-  if (!actualProfile || normalizeProfilePath(actualProfile) !== normalizeProfilePath(config.edgeUserDataDir)) {
-    throw new Error(`Refusing to use Edge at ${config.cdpUrl}: expected dedicated profile ${config.edgeUserDataDir}, but the listening browser uses ${actualProfile || "an unknown profile"}.`);
+  // Identity is the user-data directory and profile directory. --enable-automation is not part of this check.
+  const match = commandLineMatchesProfile(commandLine, config);
+  if (!match.ok) {
+    throw new Error(`Refusing to use Edge at ${config.cdpUrl}: ${match.reason}`);
   }
 }
 
@@ -134,18 +193,22 @@ export function clearSavedTabSessions(profileDirectory) {
   }
 }
 
+function usesExternalProfile(config) {
+  return config.profileTarget === "user" || config.profileTarget === "custom";
+}
+
 export function edgeLaunchArguments(config) {
   const cdpUrl = new URL(config.cdpUrl);
   const port = cdpUrl.port || (cdpUrl.protocol === "https:" ? "443" : "80");
+  const external = usesExternalProfile(config);
   return [
       `--remote-debugging-port=${port}`,
       "--remote-debugging-address=127.0.0.1",
       `--user-data-dir=${config.edgeUserDataDir}`,
-      "--profile-directory=Default",
-      "--enable-automation",
-      "--disable-extensions",
-      "--disable-sync",
-      "--disable-default-apps",
+      `--profile-directory=${config.profileDirectory || "Default"}`,
+      ...(config.stealth === true ? [] : ["--enable-automation"]),
+      ...(config.disableExtensions === false ? [] : ["--disable-extensions"]),
+      ...(external ? [] : ["--disable-sync", "--disable-default-apps"]),
       "--disable-session-crashed-bubble",
       ...(config.headless ? ["--headless=new"] : []),
       "--no-first-run",
@@ -154,13 +217,23 @@ export function edgeLaunchArguments(config) {
   ];
 }
 
+const BLANK_PAGE_URLS = new Set(["about:blank", "edge://newtab/", "chrome://newtab/"]);
+
 export function launchEdge(config) {
-  const executable = findEdgeExecutable(config.edgeExecutable);
+  const executable = findBrowserExecutable(config);
+  const label = browserLabel(config);
   if (!executable) {
-    throw new Error("Microsoft Edge was not found. Set EDGE_EXECUTABLE in .env.");
+    const setting = label === "Chrome" ? "BROWSER_CHROME_EXECUTABLE" : "EDGE_EXECUTABLE";
+    throw new Error(`${label} was not found. Set ${setting}.`);
   }
 
-  fs.mkdirSync(config.edgeUserDataDir, { recursive: true });
+  if (usesExternalProfile(config)) {
+    if (!fs.existsSync(config.edgeUserDataDir)) {
+      throw new Error(`Browser profile directory does not exist: ${config.edgeUserDataDir}`);
+    }
+  } else {
+    fs.mkdirSync(config.edgeUserDataDir, { recursive: true });
+  }
 
   const child = spawn(
     executable,
@@ -268,7 +341,7 @@ async function cleanupFailedLaunch({
       let cleanupBrowser;
       try {
         cleanupBrowser = await chromium.connectOverCDP(config.cdpUrl, { timeout: 5_000 });
-        await assertDedicatedProfile(cleanupBrowser, config);
+        await assertExpectedProfile(cleanupBrowser, config);
         await closeBrowserThroughCdp(cleanupBrowser);
         closed = true;
       } catch {
@@ -312,6 +385,7 @@ export class EdgeSession {
   #reconnectPromise;
   #sleep;
   #shuttingDown = false;
+  #nextDialog = null;
 
   constructor(browser, context, page, launched, reconnectFactory, options = {}) {
     this.browser = browser;
@@ -326,7 +400,62 @@ export class EdgeSession {
     this.logger = options.logger || (() => {});
     this.#sleep = options.sleep || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.#reconnectFactory = reconnectFactory;
+    this.#nextDialog = null;
+    this.lastDialog = null;
+    this.downloads = [];
+    this.artifactsDir = options.artifactsDir || "";
+    this.inspection = createInspectionLog();
     if (page) this.#trackOwnedPage(page, "primary");
+  }
+
+  armDialog(choice) {
+    this.#nextDialog = choice;
+  }
+
+  dialogStatus() {
+    return this.#nextDialog;
+  }
+
+  consumeDownloads() {
+    const downloads = this.downloads;
+    this.downloads = [];
+    return downloads;
+  }
+
+  async applyWindow(width, height) {
+    if (!width || !height) return false;
+    const page = this.page?.();
+    if (!page?.setViewportSize) return false;
+    await page.setViewportSize({ width, height }).catch(() => {});
+    if (!this.browser?.newBrowserCDPSession) return true;
+    let cdp;
+    try {
+      cdp = await this.browser.newBrowserCDPSession();
+      const target = await cdp.send("Browser.getWindowForTarget");
+      await cdp.send("Browser.setWindowBounds", {
+        windowId: target.windowId,
+        bounds: { width, height, windowState: "normal" },
+      });
+      return true;
+    } catch {
+      return true;
+    } finally {
+      await cdp?.detach?.().catch(() => {});
+    }
+  }
+
+  async #saveDownload(download) {
+    try {
+      const rawName = String(download.suggestedFilename?.() || "download");
+      const safe = rawName.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "").slice(0, 80) || "download";
+      const directory = this.artifactsDir || path.join(process.cwd(), "artifacts");
+      fs.mkdirSync(directory, { recursive: true });
+      const filename = path.join(directory, `${Date.now()}-${safe}`);
+      await download.saveAs(filename);
+      this.downloads.push({ name: safe, artifact: path.relative(process.cwd(), filename) });
+    } catch (error) {
+      this.logger(`Download failed: ${error.message}`);
+    }
   }
 
   #schedulePopupSettlement() {
@@ -366,9 +495,49 @@ export class EdgeSession {
     const onClose = () => {
       this.#untrackOwnedPage(page);
     };
+    const onDialog = (dialog) => {
+      const armed = this.#nextDialog;
+      this.#nextDialog = null;
+      const decision = armed?.decision === "accept" ? "accept" : "dismiss";
+      this.lastDialog = {
+        type: String(dialog.type?.() || "alert"),
+        message: String(dialog.message?.() || "").replace(/\s+/g, " ").trim().slice(0, 300),
+        decision,
+        armed: Boolean(armed),
+      };
+      const response = decision === "accept"
+        ? dialog.accept?.(armed?.promptText || "")
+        : dialog.dismiss?.();
+      Promise.resolve(response).catch(() => {});
+    };
+    const onDownload = (download) => {
+      void this.#saveDownload(download);
+    };
+    const onConsole = (message) => this.inspection.console(message);
+    const onPageError = (error) => this.inspection.pageError(error);
+    const onRequest = (request) => this.inspection.request(request);
+    const onResponse = (response) => this.inspection.response(response);
+    const onRequestFailed = (request) => this.inspection.requestFailed(request);
     page.on?.("popup", onPopup);
     page.on?.("close", onClose);
-    this.#pageHandlers.set(page, { onPopup, onClose });
+    page.on?.("dialog", onDialog);
+    page.on?.("download", onDownload);
+    page.on?.("console", onConsole);
+    page.on?.("pageerror", onPageError);
+    page.on?.("request", onRequest);
+    page.on?.("response", onResponse);
+    page.on?.("requestfailed", onRequestFailed);
+    this.#pageHandlers.set(page, {
+      onPopup,
+      onClose,
+      onDialog,
+      onDownload,
+      onConsole,
+      onPageError,
+      onRequest,
+      onResponse,
+      onRequestFailed,
+    });
     return page;
   }
 
@@ -377,6 +546,13 @@ export class EdgeSession {
     if (handlers) {
       page.off?.("popup", handlers.onPopup);
       page.off?.("close", handlers.onClose);
+      page.off?.("dialog", handlers.onDialog);
+      page.off?.("download", handlers.onDownload);
+      page.off?.("console", handlers.onConsole);
+      page.off?.("pageerror", handlers.onPageError);
+      page.off?.("request", handlers.onRequest);
+      page.off?.("response", handlers.onResponse);
+      page.off?.("requestfailed", handlers.onRequestFailed);
       this.#pageHandlers.delete(page);
     }
     this.#ownedPages.delete(page);
@@ -662,7 +838,9 @@ export async function connectEdge(config, logger = () => {}, connectionOptions =
   }
 
   const leaseId = connectionOptions.leaseId || createLeaseId();
-  return withEdgeLifecycleLock(config.edgeUserDataDir, async (paths) => {
+  const external = usesExternalProfile(config);
+  const lifecycleDirectory = config.lifecycleDirectory || config.edgeUserDataDir;
+  return withEdgeLifecycleLock(lifecycleDirectory, async (paths) => {
     let launched = null;
     let browser;
     let browserKey = "";
@@ -671,25 +849,28 @@ export async function connectEdge(config, logger = () => {}, connectionOptions =
     let metadata = await getCdpMetadata(config.cdpUrl);
     try {
       if (!metadata) {
-        if (!config.autoLaunchEdge) {
-          throw new Error(`No browser is listening at ${config.cdpUrl}. Run npm run edge first.`);
+        if (config.connectionMode === "attach" || !config.autoLaunchEdge) {
+          const hint = config.connectionMode === "attach"
+            ? `Start the selected ${browserLabel(config)} with that loopback debugging port, then attach again.`
+            : "Run npm run edge first.";
+          throw new Error(`No browser is listening at ${config.cdpUrl}. ${hint}`);
         }
-        if (config.clearSessionTabsOnStart) clearSavedTabSessions(config.edgeUserDataDir);
+        if (config.clearSessionTabsOnStart && !external) clearSavedTabSessions(config.edgeUserDataDir);
         launched = launchEdge(config);
-        logger(`Started Edge (${launched.executable}) with profile ${config.edgeUserDataDir}`);
+        logger(`Started ${browserLabel(config)} (${launched.executable}) with profile ${config.edgeUserDataDir}`);
         metadata = await waitForCdp(config.cdpUrl);
       }
 
       browserKey = browserKeyFromWebSocketUrl(metadata.webSocketDebuggerUrl);
-      if (!browserKey) throw new Error("Edge returned an invalid CDP browser identity.");
+      if (!browserKey) throw new Error(`${browserLabel(config)} returned an invalid CDP browser identity.`);
 
       browser = await chromium.connectOverCDP(config.cdpUrl, { timeout: 15_000 });
-      await assertDedicatedProfile(browser, config);
+      await assertExpectedProfile(browser, config);
       profileVerified = true;
       const context = browser.contexts()[0];
-      if (!context) throw new Error("Connected to Edge, but no browser context was available.");
+      if (!context) throw new Error(`Connected to ${browserLabel(config)}, but no browser context was available.`);
 
-      if (launched) {
+      if (launched && !external) {
         writeManagedOwner(paths, {
           browserKey,
           cdpUrl: config.cdpUrl,
@@ -727,27 +908,28 @@ export async function connectEdge(config, logger = () => {}, connectionOptions =
         : createPageInBackground(browser, context);
 
       let page;
-      if (firstClient && managed && config.autoCloseTabs) {
+      if (firstClient && managed && config.autoCloseTabs && !external && config.connectionMode !== "attach") {
         await waitForPagesToSettle(context, config.popupQuietMs, 2_000);
         const pages = context.pages().filter((candidate) => !candidate.isClosed());
-        page = pages.find((candidate) => ["about:blank", "edge://newtab/"].includes(candidate.url()))
+        page = pages.find((candidate) => BLANK_PAGE_URLS.has(candidate.url()))
           || await createPage();
         for (const candidate of pages) {
           if (candidate !== page) await candidate.close();
         }
       } else if (firstClient && launched) {
         const pages = context.pages().filter((candidate) => !candidate.isClosed());
-        page = pages.find((candidate) => ["about:blank", "edge://newtab/"].includes(candidate.url()))
+        page = pages.find((candidate) => BLANK_PAGE_URLS.has(candidate.url()))
           || pages.at(-1)
           || await createPage();
       } else {
         page = await createPage();
       }
       const lifecycle = {
-        profileDirectory: config.edgeUserDataDir,
+        profileDirectory: lifecycleDirectory,
         leaseId,
         browserKey,
-        managed,
+        managed: external ? false : managed,
+        externalProfile: external,
       };
       const session = new EdgeSession(
         browser,
@@ -764,6 +946,7 @@ export async function connectEdge(config, logger = () => {}, connectionOptions =
           bringToFront: config.bringToFront,
           backgroundPages: !config.bringToFront,
           popupQuietMs: config.popupQuietMs,
+          artifactsDir: config.artifactsDir,
           logger,
         },
       );
@@ -782,7 +965,8 @@ export async function connectEdge(config, logger = () => {}, connectionOptions =
         });
         if (stopped) removeManagedOwner(paths);
       } else if (browser?.isConnected?.()) {
-        await browser.close().catch(() => {});
+        if (launched) await browser.close().catch(() => {});
+        else if (typeof browser.disconnect === "function") await browser.disconnect().catch(() => {});
       }
       throw error;
     }
@@ -798,7 +982,7 @@ export async function forceCloseEdge(config) {
     }
     const browser = await chromium.connectOverCDP(config.cdpUrl, { timeout: 15_000 });
     try {
-      await assertDedicatedProfile(browser, config);
+      await assertExpectedProfile(browser, config);
       await closeBrowserThroughCdp(browser);
     } finally {
       clearLifecycleState(paths);

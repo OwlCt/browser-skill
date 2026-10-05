@@ -1,6 +1,7 @@
 node_modules/
 .env
 .mcp-edge-profile/
+.mcp-chrome-profile/
 .play-visible-profile/
 .codex/
 .runtime/

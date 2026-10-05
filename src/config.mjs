@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -7,6 +8,51 @@ function parseBoolean(value, fallback, name) {
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   throw new Error(`${name} must be true or false.`);
+}
+
+function parseEnum(value, allowed, fallback, name) {
+  if (value == null || value === "") return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (!allowed.includes(normalized)) {
+    throw new Error(`${name} must be one of: ${allowed.join(", ")}.`);
+  }
+  return normalized;
+}
+
+function parseProfileDirectory(value) {
+  const name = value == null || value === "" ? "Default" : String(value).trim();
+  if (!/^(Default|Profile \d+)$/.test(name)) {
+    throw new Error("EDGE_PROFILE_DIRECTORY must be Default or Profile N.");
+  }
+  return name;
+}
+
+export function userEdgeDataDirectory(env = process.env) {
+  return userBrowserDataDirectory("edge", env);
+}
+
+export function userBrowserDataDirectory(product, env = process.env) {
+  if (product === "chrome") {
+    if (process.platform === "win32" && env.LOCALAPPDATA) {
+      return path.join(env.LOCALAPPDATA, "Google", "Chrome", "User Data");
+    }
+    if (process.platform === "darwin") {
+      return path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
+    }
+    return path.join(os.homedir(), ".config", "google-chrome");
+  }
+  if (process.platform === "win32" && env.LOCALAPPDATA) {
+    return path.join(env.LOCALAPPDATA, "Microsoft", "Edge", "User Data");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Microsoft Edge");
+  }
+  return path.join(os.homedir(), ".config", "microsoft-edge");
+}
+
+export function externalLifecycleDirectory(profilePath, cwd) {
+  const hash = createHash("sha256").update(path.resolve(profilePath).toLowerCase()).digest("hex").slice(0, 16);
+  return path.resolve(cwd, ".runtime", "lifecycle", hash);
 }
 
 function parseInteger(value, fallback, name, { min, max }) {
@@ -44,6 +90,63 @@ function parseAllowedOrigins(value) {
   );
 }
 
+function resolveProfileSelection(env, cwd) {
+  const browserProduct = parseEnum(env.BROWSER_PRODUCT, ["edge", "chrome"], "edge", "BROWSER_PRODUCT");
+  const profileTarget = parseEnum(
+    env.EDGE_PROFILE_TARGET,
+    ["dedicated", "user", "custom"],
+    "dedicated",
+    "EDGE_PROFILE_TARGET",
+  );
+  const profileDirectory = parseProfileDirectory(env.EDGE_PROFILE_DIRECTORY);
+  const dedicatedProfiles = {
+    edge: resolveEdgeProfile(env.EDGE_USER_DATA_DIR, env, cwd),
+    chrome: env.BROWSER_CHROME_USER_DATA_DIR?.trim()
+      ? path.resolve(cwd, env.BROWSER_CHROME_USER_DATA_DIR.trim())
+      : path.resolve(cwd, ".mcp-chrome-profile"),
+  };
+  const dedicatedUserDataDir = dedicatedProfiles[browserProduct];
+  const dedicatedRequireProfile = parseBoolean(
+    env.EDGE_REQUIRE_DEDICATED_PROFILE,
+    false,
+    "EDGE_REQUIRE_DEDICATED_PROFILE",
+  );
+  const dedicatedAutoCloseTabs = parseBoolean(env.EDGE_AUTO_CLOSE_TABS, false, "EDGE_AUTO_CLOSE_TABS");
+  const dedicatedClearSessionTabs = parseBoolean(
+    env.EDGE_CLEAR_SESSION_TABS_ON_START,
+    false,
+    "EDGE_CLEAR_SESSION_TABS_ON_START",
+  );
+  const external = profileTarget === "user" || profileTarget === "custom";
+  let edgeUserDataDir = dedicatedUserDataDir;
+  if (profileTarget === "user") {
+    edgeUserDataDir = userBrowserDataDirectory(browserProduct, env);
+  } else if (profileTarget === "custom") {
+    const custom = env.EDGE_CUSTOM_USER_DATA_DIR?.trim();
+    if (!custom) throw new Error("EDGE_PROFILE_TARGET=custom requires EDGE_CUSTOM_USER_DATA_DIR.");
+    edgeUserDataDir = path.resolve(custom);
+  }
+
+  return {
+    workspaceRoot: path.resolve(cwd),
+    browserProduct,
+    dedicatedProfiles,
+    profileTarget,
+    profileDirectory,
+    dedicatedUserDataDir,
+    dedicatedRequireProfile,
+    dedicatedAutoCloseTabs,
+    dedicatedClearSessionTabs,
+    edgeUserDataDir,
+    requireDedicatedProfile: external ? false : dedicatedRequireProfile,
+    autoCloseTabs: external ? false : dedicatedAutoCloseTabs,
+    clearSessionTabsOnStart: external ? false : dedicatedClearSessionTabs,
+    lifecycleDirectory: external
+      ? externalLifecycleDirectory(edgeUserDataDir, cwd)
+      : dedicatedUserDataDir,
+  };
+}
+
 export function loadConfig(env = process.env, cwd = process.cwd()) {
   const stateMode = (env.RESPONSES_STATE_MODE || "manual").trim().toLowerCase();
   if (!["manual", "previous"].includes(stateMode)) {
@@ -76,21 +179,14 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     cdpUrl: (env.EDGE_CDP_URL || "http://127.0.0.1:9222").trim(),
     autoLaunchEdge: parseBoolean(env.EDGE_AUTO_LAUNCH, true, "EDGE_AUTO_LAUNCH"),
     edgeExecutable: env.EDGE_EXECUTABLE?.trim() || "",
-    edgeUserDataDir: resolveEdgeProfile(env.EDGE_USER_DATA_DIR, env, cwd),
-    requireDedicatedProfile: parseBoolean(
-      env.EDGE_REQUIRE_DEDICATED_PROFILE,
-      false,
-      "EDGE_REQUIRE_DEDICATED_PROFILE",
-    ),
+    chromeExecutable: env.BROWSER_CHROME_EXECUTABLE?.trim() || "",
+    ...resolveProfileSelection(env, cwd),
     keepEdgeOpen: parseBoolean(env.EDGE_KEEP_OPEN, true, "EDGE_KEEP_OPEN"),
     bringToFront: parseBoolean(env.EDGE_BRING_TO_FRONT, true, "EDGE_BRING_TO_FRONT"),
     headless: parseBoolean(env.EDGE_HEADLESS, false, "EDGE_HEADLESS"),
-    autoCloseTabs: parseBoolean(env.EDGE_AUTO_CLOSE_TABS, false, "EDGE_AUTO_CLOSE_TABS"),
-    clearSessionTabsOnStart: parseBoolean(
-      env.EDGE_CLEAR_SESSION_TABS_ON_START,
-      false,
-      "EDGE_CLEAR_SESSION_TABS_ON_START",
-    ),
+    disableExtensions: parseBoolean(env.EDGE_DISABLE_EXTENSIONS, true, "EDGE_DISABLE_EXTENSIONS"),
+    stealth: parseBoolean(env.EDGE_STEALTH, false, "EDGE_STEALTH"),
+    connectionMode: parseEnum(env.EDGE_CONNECTION_MODE, ["managed", "attach"], "managed", "EDGE_CONNECTION_MODE"),
     tabIdleTimeoutMs: parseInteger(
       env.EDGE_TAB_IDLE_TIMEOUT_MS,
       0,
@@ -105,6 +201,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     ),
     allowRemoteCdp: parseBoolean(env.ALLOW_REMOTE_CDP, false, "ALLOW_REMOTE_CDP"),
     allowedOrigins: parseAllowedOrigins(env.BROWSER_ALLOWED_ORIGINS),
+    sitePolicy: parseEnum(env.BROWSER_SITE_POLICY, ["ask", "allow"], "ask", "BROWSER_SITE_POLICY"),
     maxTextChars: parseInteger(
       env.BROWSER_MAX_TEXT_CHARS,
       20_000,
